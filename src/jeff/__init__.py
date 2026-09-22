@@ -13,6 +13,7 @@
 from .calibrate import fit_temperature
 from .engine import DEFAULT_MODEL, Jeff
 from .prompt import Answer, Question, boolean, choice, score
+from .slots import SLOT_SETS, estimate_slot_bias, spread
 
 __all__ = [
     "Answer",
@@ -21,6 +22,9 @@ __all__ = [
     "Question",
     "boolean",
     "choice",
+    "SLOT_SETS",
+    "estimate_slot_bias",
     "fit_temperature",
     "score",
+    "spread",
 ]

@@ -29,7 +29,8 @@ QUESTIONS = [
 
 def main() -> None:
     jeff = Jeff()
-    answers = jeff.ask(TICKET.strip(), QUESTIONS)
+    # Debiasing is off by default; see examples/letter_bias.py for what it buys.
+    answers = jeff.ask(TICKET.strip(), QUESTIONS, permutations="all")
 
     for answer in answers:
         bar = "#" * round(answer.confidence * 20)

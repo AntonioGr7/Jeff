@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from jeff import Jeff, boolean, choice, score
+from jeff import SLOT_SETS, Jeff, boolean, choice, score
 from jeff.engine import _common_prefix_len
 from jeff.prompt import Question
 
@@ -87,6 +87,76 @@ def test_answers_are_typed_and_total(jeff: Jeff):
         assert 0.0 <= answer.confidence <= 1.0
     assert 1.0 <= answers[-1].expected_value <= 5.0
     assert jeff.stats["output_tokens"] == 0
+
+
+def test_permutations_are_off_unless_asked_for(jeff: Jeff):
+    plain = jeff.ask(STATE, QUESTIONS)
+    assert jeff.stats["forward_rows"] == len(QUESTIONS)
+    for answer in plain:
+        assert answer.permutations == 1
+        assert answer.disagreement == 0.0
+    assert plain[0].probabilities == pytest.approx(
+        jeff.ask(STATE, QUESTIONS, permutations=1)[0].probabilities
+    )
+
+
+def test_permutations_score_every_layout_and_stay_typed(jeff: Jeff):
+    answers = jeff.ask(STATE, QUESTIONS, permutations="all")
+    assert jeff.stats["forward_rows"] == sum(len(q.options) for q in QUESTIONS)
+    for answer, question in zip(answers, QUESTIONS):
+        assert answer.permutations == len(question.options)
+        assert answer.choice in question.options
+        assert sum(answer.probabilities) == pytest.approx(1.0)
+        assert 0.0 <= answer.disagreement <= 1.0
+        for sample in answer.samples:
+            assert sum(sample) == pytest.approx(1.0)
+
+
+def test_permutations_are_capped_at_the_option_count(jeff: Jeff):
+    answers = jeff.ask(STATE, QUESTIONS, permutations=99)
+    for answer, question in zip(answers, QUESTIONS):
+        assert answer.permutations == len(question.options)
+
+
+def test_both_aggregates_produce_a_distribution(jeff: Jeff):
+    for aggregate in ("logmean", "mean"):
+        for answer in jeff.ask(STATE, QUESTIONS, permutations="all", aggregate=aggregate):
+            assert sum(answer.probabilities) == pytest.approx(1.0)
+    with pytest.raises(ValueError):
+        jeff.ask(STATE, QUESTIONS, aggregate="median")
+
+
+def test_slot_symbols_are_configurable(jeff: Jeff):
+    for slots in ("letters", "digits", "XYZW"):
+        for answer in jeff.ask(STATE, QUESTIONS[:4], slots=slots):
+            assert sum(answer.probabilities) == pytest.approx(1.0)
+            assert set(answer.slots) <= set(SLOT_SETS.get(slots, slots))
+
+
+def test_a_pool_too_small_for_the_options_is_refused(jeff: Jeff):
+    with pytest.raises(ValueError, match="slot symbols"):
+        jeff.ask(STATE, [choice("pick", ["a", "b", "c"])], slots="XY")
+
+
+def test_shuffled_slots_are_per_question_and_reproducible(jeff: Jeff):
+    first = jeff.ask(STATE, QUESTIONS, shuffle_slots=True)
+    again = jeff.ask(STATE, QUESTIONS, shuffle_slots=True)
+    assert [a.slots for a in first] == [a.slots for a in again]
+    assert [a.probabilities for a in first] == [a.probabilities for a in again]
+    assert [a.slots for a in first] != [a.slots for a in jeff.ask(STATE, QUESTIONS)]
+    # Questions of the same width should not all share one favoured symbol.
+    pairs = [a.slots for a in first if len(a.slots) == 2]
+    assert len(pairs) >= 3 and len(set(pairs)) > 1
+
+
+def test_shuffling_keeps_one_symbol_set_per_question_so_the_cover_still_cancels(jeff: Jeff):
+    for answer in jeff.ask(STATE, QUESTIONS, permutations="all", shuffle_slots=True):
+        assert len(answer.slots) == len(answer.question.options)
+        assert len(answer.layouts) == len(answer.question.options)
+        for option in range(len(answer.question.options)):
+            assert sorted(l.index(option) for l in answer.layouts) == list(
+                range(len(answer.question.options))
+            )
 
 
 def test_temperature_only_moves_confidence(jeff: Jeff):

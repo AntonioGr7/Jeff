@@ -11,7 +11,8 @@ import json
 import sys
 from typing import Any
 
-from .engine import DEFAULT_MODEL, Jeff
+from .engine import AGGREGATES, DEFAULT_MODEL, Jeff
+from .slots import DEFAULT_SLOTS, SLOT_SETS
 
 
 def _load(path: str | None) -> dict[str, Any]:
@@ -28,6 +29,38 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--device", default=None, help="cuda, mps, cpu (default: best available)")
     parser.add_argument("--temperature", type=float, default=1.0, help="calibration temperature")
+    parser.add_argument(
+        "--permutations",
+        default="1",
+        help="score each question under N cyclic option relabellings and average out "
+        "the model's letter bias; 'all' for a full cover (default: 1, no debiasing)",
+    )
+    parser.add_argument("--aggregate", default="logmean", choices=AGGREGATES)
+    parser.add_argument(
+        "--slots",
+        default=DEFAULT_SLOTS,
+        help=f"symbols the options wear: {', '.join(SLOT_SETS)}, or a literal string "
+        f"like ABXY (default: {DEFAULT_SLOTS})",
+    )
+    parser.add_argument(
+        "--shuffle-slots",
+        action="store_true",
+        help="draw each question its own symbols from the pool, seeded by the question",
+    )
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--min-probability",
+        type=float,
+        default=0.0,
+        help="withhold an answer whose winning option scores below this",
+    )
+    parser.add_argument(
+        "--min-mass",
+        type=float,
+        default=0.0,
+        help="withhold an answer when the options captured less than this share "
+        "of the model's full next-token distribution",
+    )
     parser.add_argument("--max-batch", type=int, default=16)
     parser.add_argument("--stats", action="store_true", help="also report timing and tokens saved")
     args = parser.parse_args(argv)
@@ -37,6 +70,13 @@ def main(argv: list[str] | None = None) -> int:
         args.model,
         device=args.device,
         temperature=args.temperature,
+        permutations="all" if args.permutations == "all" else int(args.permutations),
+        aggregate=args.aggregate,
+        slots=args.slots,
+        shuffle_slots=args.shuffle_slots,
+        seed=args.seed,
+        min_probability=args.min_probability,
+        min_mass=args.min_mass,
         max_batch=args.max_batch,
     )
     answers = jeff.ask(payload["state"], payload["questions"])

@@ -23,9 +23,18 @@ from typing import Any, Iterable, Sequence
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
-from .prompt import Answer, LETTERS, Question, coerce_all, messages, render_state
+from .prompt import (
+    Answer,
+    Question,
+    coerce_all,
+    cyclic_layouts,
+    messages,
+    render_state,
+)
+from .slots import DEFAULT_SLOTS, resolve_slots, take_slots
 
 DEFAULT_MODEL = "Qwen/Qwen3-0.6B"
+AGGREGATES = ("logmean", "mean")
 
 
 def _pick_device(device: str | None) -> torch.device:
@@ -48,6 +57,27 @@ def _layer_kv(cache: DynamicCache, index: int) -> tuple[torch.Tensor, torch.Tens
 
 def _cache_depth(cache: DynamicCache) -> int:
     return len(cache.layers) if hasattr(cache, "layers") else len(cache.key_cache)
+
+
+def pool(samples: torch.Tensor, aggregate: str = "logmean") -> torch.Tensor:
+    """Fold one question's per-layout log-probabilities into a single score.
+
+    `logmean` averages in log space. Write the model's readout as
+    `score(option) + bias(letter)`: under a full cyclic cover every option wears
+    every letter exactly once, so the average picks up `mean(bias)` — the same
+    constant for every option — and that constant vanishes in the softmax. The
+    letter bias is gone, exactly, without ever estimating it.
+
+    `mean` averages the probabilities instead. It only marginalises over
+    layouts rather than cancelling the bias, but it is the gentler of the two:
+    log space is unforgiving, where one layout putting an option near zero
+    holds the whole average down.
+    """
+    if aggregate == "logmean":
+        return samples.mean(dim=0)
+    if aggregate == "mean":
+        return samples.exp().mean(dim=0).log()
+    raise ValueError(f"aggregate must be one of {AGGREGATES}")
 
 
 def _common_prefix_len(sequences: Sequence[Sequence[int]]) -> int:
@@ -75,6 +105,13 @@ class Jeff:
         device: str | None = None,
         dtype: torch.dtype | None = None,
         temperature: float = 1.0,
+        permutations: int | str = 1,
+        aggregate: str = "logmean",
+        slots: str = DEFAULT_SLOTS,
+        shuffle_slots: bool = False,
+        seed: int = 0,
+        min_probability: float = 0.0,
+        min_mass: float = 0.0,
         max_batch: int = 16,
     ) -> None:
         self.device = _pick_device(device)
@@ -86,9 +123,16 @@ class Jeff:
         ).to(self.device).eval()
         self.name = model
         self.temperature = temperature
+        self.permutations = permutations
+        self.aggregate = aggregate
+        self.slots = slots
+        self.shuffle_slots = shuffle_slots
+        self.seed = seed
+        self.min_probability = min_probability
+        self.min_mass = min_mass
         self.max_batch = max_batch
         self.stats: dict[str, Any] = {}
-        self._slots = self._answer_slots()
+        self._tokens: dict[str, list[int]] = {}
         self._pad = self.tokenizer.pad_token_id
         if self._pad is None:
             self._pad = self.tokenizer.eos_token_id
@@ -96,26 +140,34 @@ class Jeff:
 
     # -- setup ----------------------------------------------------------------
 
-    def _answer_slots(self) -> list[int]:
-        """Token id of each answer letter, checked to be one exact round-trip token."""
-        slots = []
-        for letter in LETTERS:
-            ids = self.tokenizer.encode(letter, add_special_tokens=False)
-            if len(ids) != 1 or self.tokenizer.decode(ids) != letter:
-                raise ValueError(f"{self.name} does not tokenise answer slot {letter!r} as one token")
-            slots.append(ids[0])
-        if len(set(slots)) != len(slots):
-            raise ValueError(f"{self.name} maps two answer slots to the same token")
-        return slots
+    def _slot_tokens(self, symbols: str) -> list[int]:
+        """Token id of each slot symbol, checked to be one exact round-trip token."""
+        if symbols in self._tokens:
+            return self._tokens[symbols]
+        ids = []
+        for symbol in symbols:
+            encoded = self.tokenizer.encode(symbol, add_special_tokens=False)
+            if len(encoded) != 1 or self.tokenizer.decode(encoded) != symbol:
+                raise ValueError(f"{self.name} does not tokenise slot {symbol!r} as one token")
+            ids.append(encoded[0])
+        if len(set(ids)) != len(ids):
+            raise ValueError(f"{self.name} maps two of the slots {symbols!r} to one token")
+        self._tokens[symbols] = ids
+        return ids
 
-    def _encode(self, state: str, question: Question) -> list[int]:
+    def _encode(
+        self,
+        state: str,
+        question: Question,
+        layout: Sequence[int] | None = None,
+        slots: str = "",
+    ) -> list[int]:
+        turns = messages(state, question, layout, slots)
         kwargs = dict(tokenize=False, add_generation_prompt=True)
         try:
-            text = self.tokenizer.apply_chat_template(
-                messages(state, question), enable_thinking=False, **kwargs
-            )
+            text = self.tokenizer.apply_chat_template(turns, enable_thinking=False, **kwargs)
         except TypeError:  # template does not know about thinking mode
-            text = self.tokenizer.apply_chat_template(messages(state, question), **kwargs)
+            text = self.tokenizer.apply_chat_template(turns, **kwargs)
         return self.tokenizer.encode(text, add_special_tokens=False)
 
     # -- the trick ------------------------------------------------------------
@@ -186,45 +238,136 @@ class Jeff:
         questions: Iterable[Any],
         *,
         temperature: float | None = None,
+        permutations: int | str | None = None,
+        aggregate: str | None = None,
+        slots: str | None = None,
+        shuffle_slots: bool | None = None,
+        min_probability: float | None = None,
+        min_mass: float | None = None,
     ) -> list[Answer]:
-        """Answer every question about one state. Returns one `Answer` per question."""
+        """Answer every question about one state. Returns one `Answer` per question.
+
+        `permutations` scores each question under that many cyclic relabellings
+        of its options and averages the results, which cancels the model's
+        preference for particular answer slots. It costs one extra suffix per
+        extra layout — the state is still prefilled once — so it is cheap, but
+        it is off by default because it is not free. `"all"` uses a full cover,
+        the only setting that removes an additive slot bias exactly.
+
+        `slots` chooses the symbols the options wear: a preset name from
+        `jeff.slots.SLOT_SETS` or a literal string. `shuffle_slots` draws each
+        question its own subset instead of always using the first few, which
+        stops one workload-wide favourite from forming. The draw is seeded by
+        the question, so answers stay reproducible, and it happens once per
+        question rather than once per layout — so the cyclic cover still sees a
+        fixed symbol set and still cancels exactly.
+
+        `min_probability` and `min_mass` are floors below which the answer is
+        withheld: `Answer.value` becomes `None` and `Answer.abstained` is set,
+        while `Answer.choice` still reports what the model would have said. The
+        two catch different failures — a low probability means the model could
+        not choose between your options, a low mass means it did not want to
+        answer from your options at all.
+        """
         started = time.perf_counter()
         temperature = self.temperature if temperature is None else temperature
         if temperature <= 0:
             raise ValueError("temperature must be positive")
+        permutations = self.permutations if permutations is None else permutations
+        aggregate = self.aggregate if aggregate is None else aggregate
+        if aggregate not in AGGREGATES:
+            raise ValueError(f"aggregate must be one of {AGGREGATES}")
+        pool_symbols = resolve_slots(self.slots if slots is None else slots)
+        shuffle = self.shuffle_slots if shuffle_slots is None else shuffle_slots
+        min_probability = self.min_probability if min_probability is None else min_probability
+        min_mass = self.min_mass if min_mass is None else min_mass
+        if not 0.0 <= min_probability <= 1.0 or not 0.0 <= min_mass <= 1.0:
+            raise ValueError("min_probability and min_mass are probabilities, in 0..1")
         questions = coerce_all(questions)
         text = render_state(state)
-        prompts = [self._encode(text, q) for q in questions]
+
+        # Each question keeps one symbol set across all of its layouts, so the
+        # cover below still sends every option past every symbol exactly once.
+        chosen = [
+            take_slots(
+                pool_symbols,
+                len(question.options),
+                key=question.key if shuffle else None,
+                seed=self.seed,
+            )
+            for question in questions
+        ]
+        for symbols in set(chosen):
+            self._slot_tokens(symbols)
+
+        # One row per (question, option layout). They all share the same state,
+        # so the extra layouts ride along on the same prefill.
+        rows = [
+            (index, layout)
+            for index, question in enumerate(questions)
+            for layout in cyclic_layouts(len(question.options), permutations)
+        ]
+        prompts = [
+            self._encode(text, questions[index], layout, chosen[index]) for index, layout in rows
+        ]
 
         prefix_len = _common_prefix_len(prompts)
         prefix = prompts[0][:prefix_len]
         kv = self._prefill(prefix) if prefix_len else []
         prefilled = time.perf_counter()
 
-        rows = []
+        scored = []
         for start in range(0, len(prompts), self.max_batch):
             chunk = prompts[start : start + self.max_batch]
             if prefix_len:
-                rows.append(self._score_batch(kv, prefix_len, [p[prefix_len:] for p in chunk]))
+                scored.append(self._score_batch(kv, prefix_len, [p[prefix_len:] for p in chunk]))
             else:
-                rows.append(self._score_batch([], 0, chunk))
-        logits = torch.cat(rows)
+                scored.append(self._score_batch([], 0, chunk))
+        logits = torch.cat(scored)
+
+        # Undo each relabelling, then fold the layouts of one question together.
+        # Normalising over the whole vocabulary first costs nothing we do not
+        # already have, and it is the only way to see how much of the model's
+        # attention the menu actually captured.
+        samples: list[list[torch.Tensor]] = [[] for _ in questions]
+        layouts: list[list[tuple[int, ...]]] = [[] for _ in questions]
+        masses: list[list[float]] = [[] for _ in questions]
+        for (index, layout), row in zip(rows, logits):
+            shown = torch.log_softmax(row, dim=-1)[self._slot_tokens(chosen[index])]
+            masses[index].append(float(shown.exp().sum()))
+            layouts[index].append(layout)
+            canonical = torch.empty_like(shown)
+            canonical[list(layout)] = shown
+            samples[index].append(torch.log_softmax(canonical, dim=-1))
 
         answers = []
-        for question, row in zip(questions, logits):
-            slots = row[self._slots[: len(question.options)]]
-            probabilities = torch.softmax(slots / temperature, dim=-1)
+        for index, (question, drawn) in enumerate(zip(questions, samples)):
+            stack = torch.stack(drawn)
+            pooled = pool(stack, aggregate)
+            probabilities = torch.softmax(pooled / temperature, dim=-1)
+            mass = sum(masses[index]) / len(masses[index])
             answers.append(
-                Answer(question, tuple(probabilities.tolist()), tuple(slots.tolist()))
+                Answer(
+                    question,
+                    tuple(probabilities.tolist()),
+                    tuple(pooled.tolist()),
+                    tuple(tuple(row.exp().tolist()) for row in stack),
+                    tuple(layouts[index]),
+                    chosen[index],
+                    tuple(masses[index]),
+                    abstained=float(probabilities.max()) < min_probability or mass < min_mass,
+                )
             )
         self.stats = {
             "questions": len(questions),
+            "forward_rows": len(rows),
             "prefix_tokens": prefix_len,
             "suffix_tokens": sum(len(p) - prefix_len for p in prompts),
             "saved_tokens": prefix_len * (len(prompts) - 1),
             "prefill_seconds": prefilled - started,
             "total_seconds": time.perf_counter() - started,
             "output_tokens": 0,
+            "abstained": sum(answer.abstained for answer in answers),
         }
         return answers
 

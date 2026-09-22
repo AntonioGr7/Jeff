@@ -18,9 +18,10 @@ answers = jeff.ask(ticket, [
     score("How urgent is this, from 1 to 5?", 1, 5),
 ])
 
-answers[0].choice          # 'yes'
-answers[0]["yes"]          # 0.997
-answers[-1].expected_value # 2.51
+answers[0].value           # 'yes' — None if it was withheld
+answers[0]["yes"]          # 0.976
+answers[0].mass            # 0.99999 — share of the vocabulary that stayed on-menu
+answers[-1].expected_value # 3.86
 ```
 
 This is an open replication of the idea behind [TypeSafe's Jev][jev], following
@@ -46,13 +47,193 @@ The suffixes go through in one batched forward, left-padded so every row's last 
 token lands at the same index, with `position_ids` continuing from the prefix and the
 padding masked out. Each row sees exactly *prefix + its own question*, and nothing else.
 
-**2. The answer is a lookup, not a generation.** Options are laid out as lettered slots
-(`A.`, `B.`, …), each verified at load time to be one exact round-trip token. The forward
+**2. The answer is a lookup, not a generation.** Options are laid out as slots (`A.`,
+`B.`, … by default; the symbols are configurable), each verified to be one exact
+round-trip token before it is used. The forward
 pass ends with a distribution over the whole vocabulary; Jeff reads the logits at the
 option letters and softmaxes over just those. Zero tokens are generated, nothing is
 parsed, and a type error is not representable — the model cannot answer off-menu, cannot
 ramble, cannot emit malformed JSON. What you get back is the full distribution, not just
-the argmax.
+the argmax — plus the share of the vocabulary it was drawn from, because a softmax over
+five tokens out of 151,000 needs a chaperone.
+
+## The slot bias, and how to average it out
+
+Lettered slots have a known problem: models do not only score the *option*, they
+score the *letter*. Put the same options in a different order and the answer moves —
+sometimes all the way. This is not hypothetical, it is the first thing you see when you
+look (`uv run examples/letter_bias.py`, same ticket and the same 0.6B):
+
+```
+question         as written             debiased                moved flip
+wants_refund     yes 99.8%              yes 97.6%               0.144
+chargeback_risk  yes 99.0%              yes 88.7%               0.550
+needs_human      yes 67.9%              no  53.1%               0.302   <-- flipped
+urgency          5   52.4%              5   65.3%               0.982
+```
+
+`urgency` did not flip, but look at what it is actually doing. Its five layouts are
+barely the same question — the model mostly answers whichever option is sitting on `A`:
+
+```
+A='1'   1=43.1%  2= 0.4%  3= 0.1%  4= 1.0%  5=55.4%
+A='2'   1=95.6%  2= 2.9%  3= 0.1%  4= 0.0%  5= 1.4%
+A='3'   1=28.1%  2=19.3%  3=31.8%  4= 3.8%  5=17.0%
+A='5'   1= 0.3%  2= 0.0%  3= 0.1%  4= 4.2%  5=95.4%
+```
+
+Reading `5 at 52.4%` off one layout and calling it the answer is luck.
+
+So Jeff can score each question under several **cyclic relabellings** of its options and
+pool the results:
+
+```python
+answers = jeff.ask(ticket, questions, permutations="all")   # or permutations=3
+answers[-1].choice          # '5', not '1'
+answers[-1].disagreement    # 0.95 — how far the layouts disagreed
+```
+
+It is **off by default** and chosen at the call, per the usual rule that you should know
+what you are paying for. `permutations=N` uses `N` evenly spaced shifts, capped at the
+option count; `"all"` uses a full cover.
+
+**Why log-space pooling.** Write the readout as `score(option) + bias(letter)`. Under a
+full cyclic cover, every option wears every letter exactly once — so averaging
+*log-probabilities* across layouts picks up `mean(bias)`, the same constant for every
+option, which then vanishes in the softmax. The bias is removed exactly, without ever
+being estimated. Averaging probabilities instead (`aggregate="mean"`) only marginalises
+over layouts; it is gentler, since log space is unforgiving when one layout puts an
+option near zero, but it does not cancel. `tests/test_debias.py` proves the exact
+cancellation on synthetic logits, with no model involved.
+
+Partial covers (`N` < number of options) shrink the bias rather than cancelling it — the
+test suite pins that ordering too. And nothing here touches a bias that depends on the
+option's *content*, only on its letter.
+
+**What it costs.** One extra suffix per extra layout, off the same single prefill:
+
+| | rows scored | time |
+|---|---|---|
+| `permutations=1` (default) | 8 | 150 ms |
+| `permutations=2` | 16 | 318 ms |
+| `permutations="all"` | 23 | 406 ms |
+
+Fully debiased is still ~8× faster than generating one answer per question.
+
+`disagreement` is worth logging even when you don't debias: it is the total-variation
+spread across layouts, and it tells you which of your questions the model is not really
+answering.
+
+## Confidence over a menu nobody read
+
+`probabilities` is a softmax over a handful of vocabulary entries out of a hundred
+thousand. It is a preference *within the menu*, and it cannot tell you whether the model
+was answering your question at all. So every answer also carries `mass`: how much of the
+model's real next-token distribution landed on your options.
+
+Here is why that matters. The same eight questions, scored twice, the second time with
+Qwen's thinking mode left on by accident (`uv run examples/vocabulary_mass.py`):
+
+```
+as built                  confidence   mass
+  wants_refund     yes         99.7%   0.999995
+  needs_human      yes         67.9%   0.999986
+
+thinking left on
+  wants_refund     yes         97.2%   0.000000   <-- withheld
+  needs_human      yes         98.0%   0.000000   <-- withheld
+```
+
+The broken run is *more* confident than the healthy one. The model is about to emit
+`<think>`; it still has a favourite letter, so the renormalised numbers look perfect and
+are worth nothing. Without the mass the two runs are indistinguishable. A missing
+generation prompt does the same thing at 99.8% confidence.
+
+On a healthy prompt the mass sits at 0.9999, so this is a tripwire rather than a signal —
+which is exactly what you want from it. Wire it up as a floor and bad answers stop being
+answers:
+
+```python
+jeff = Jeff(min_mass=0.5, min_probability=0.6)
+
+answer.value       # None when a floor was missed
+answer.choice      # still there: what the model would have said
+answer.abstained   # why you got None
+```
+
+`min_mass` and `min_probability` catch different failures. A low probability means the
+model could not choose between your options; a low mass means it did not want to answer
+from your options at all. Neither is on by default, and `choice` is kept separate from
+`value` so an abstention can never be silently mistaken for a decision.
+
+The idea, the name `candidate_probability_mass` and the abstention threshold are lifted
+from [JEVfire][jevfire], which reports both and puts the arithmetic plainly: if `A` has
+10% of the vocabulary and `B` has 5%, restricting to the menu gives `A` 66.7% — a
+relative preference, not a two-in-three chance of being right.
+
+## Which symbols? Measure, don't guess
+
+Nothing requires the slots to be `A`, `B`, `C` — they only have to be single tokens. So
+the symbol set is a knob, and `estimate_slot_bias` turns it into a measured one. Under
+`score(option) + bias(symbol)`, a full cover sends every option past every symbol, so
+centring each layout and averaging leaves the symbol term standing alone. That gives each
+symbol's pull in logits, and the spread of a set is how unfair it is
+(`uv run examples/slot_bias.py`, ten four-option questions, Qwen3-0.6B):
+
+```
+set        symbols     spread   pull per symbol, in logits
+letters    ABCD          1.91   A+0.84  D+0.22  B+0.01  C-1.07
+roman      IVXL          2.62   X+0.98  L+0.78  V-0.12  I-1.64
+lower      abcd          4.27   a+2.68  d-0.52  b-0.57  c-1.59
+digits     0123          4.30   1+2.06  2+0.52  0-0.35  3-2.24
+```
+
+**`A, B, C, D` wins, and that is the opposite of what you would expect.** Digits are 2.2×
+more biased than letters on this model — `1` pulls +2.06 while `3` pushes −2.24 — and
+lowercase is just as bad. Widening the pool does not help either; the rarely-used letters
+are *worse*, not better:
+
+```
+across all of 'letters', shuffled subsets:
+  most pull   D+1.52  K+1.20  C+1.18  E+0.70  G+0.53
+  least pull  B-0.39  M-0.70  O-1.09  H-1.44  P-2.25
+```
+
+So drawing random symbols spreads the bias over a *worse* region of the space. Measured
+against the debiased answer on those ten questions:
+
+| at `permutations=1` | agreement |
+|---|---|
+| `A, B, C, D` | 10 / 10 |
+| shuffled from the 16-letter pool | 4 / 10 |
+
+The reasoning behind shuffling is sound — a systematic bias becomes variance — but the
+premise does not hold for this model: `A`–`D` is already the flattest region, because it
+is the one the training data drilled. Randomising trades a small known bias for a larger
+unknown one.
+
+One more reason to keep digits away from `score()` questions: labelling the options
+`1..5` with the slots `0..4` produces lines like `3. 5`. Pick slots that cannot be
+confused with the options they label.
+
+The knobs exist anyway, because this is a claim about *one* model and you should check
+yours:
+
+```bash
+uv run jeff --slots digits          # a preset, or a literal string like ABXY
+uv run jeff --shuffle-slots         # per-question subsets, seeded by the question
+```
+
+`shuffle_slots` draws each question its own symbols, seeded by the question id, so
+answers stay reproducible. The draw happens once **per question**, not per layout, so the
+cyclic cover still sees a fixed set and still cancels exactly — the two mechanisms
+compose rather than interfering.
+
+One trap: `estimate_slot_bias` centres each question on its own symbol set, so symbols
+are only comparable when they co-occur. Compare like with like — equal option counts, or
+shuffled subsets over a pool — or you end up comparing a symbol that only appears in the
+five-option questions against one that appears everywhere. (I made exactly that mistake
+first; it reported `E+2.39` and meant nothing.)
 
 ## Numbers
 
@@ -61,13 +242,12 @@ Eight decisions over one support ticket, `Qwen/Qwen3-0.6B` in bf16 on an RTX 205
 
 | | time | |
 |---|---|---|
-| generate one answer per question | 2743 ms | |
-| typed readout, no prefix sharing | 1284 ms | 2.1× |
-| Jeff | 245 ms | 11.2× |
-| Jeff, state already prefilled | 164 ms | 16.7× |
+| generate one answer per question | 3211 ms | |
+| typed readout, no prefix sharing | 2300 ms | 1.4× |
+| Jeff | 308 ms | 10.4× |
+| Jeff, state already prefilled | 181 ms | 17.8× |
 
-130 shared tokens prefilled once instead of eight times; 253 suffix tokens total; zero
-tokens generated. The gap widens with the size of the state and the number of questions,
+174 shared tokens prefilled once instead of eight times; zero tokens generated. The gap widens with the size of the state and the number of questions,
 which is exactly the shape of real triage, extraction and routing workloads.
 
 ## Install
@@ -84,13 +264,15 @@ tokeniser gives each of `A`–`P` a single token will work; pass it as `Jeff("..
 From the shell:
 
 ```bash
-echo '{"state": "the box arrived empty", "questions": ["Is this a refund request?"]}' | uv run jeff --stats
+echo '{"state": "the box arrived empty", "questions": ["Is this a refund request?"]}' \
+  | uv run jeff --permutations all --min-mass 0.5 --stats
 ```
 
 ## Calibration
 
-The raw probabilities are a *conditional* readout: they say which letter the model would
-emit, not how often it is right. Small models are badly overconfident. One scalar,
+The probabilities are a *conditional* readout: they say which slot the model would emit,
+not how often it is right. `mass` tells you whether it was answering; this tells you
+whether to believe it when it was. Small models are badly overconfident. One scalar,
 fitted on however many labelled examples you can scrape together, fixes most of it:
 
 ```python
@@ -121,9 +303,10 @@ run float32 and a fixed batch size.
 |---|---|
 | [src/jeff/engine.py](src/jeff/engine.py) | prefill, cache branching, batched suffix forward, typed readout |
 | [src/jeff/prompt.py](src/jeff/prompt.py) | `Question`/`Answer`, the state-first prompt |
+| [src/jeff/slots.py](src/jeff/slots.py) | answer symbols, per-question draws, bias estimator |
 | [src/jeff/calibrate.py](src/jeff/calibrate.py) | temperature fitting and calibration metrics |
 | [src/jeff/cli.py](src/jeff/cli.py) | `jeff` — JSON in, JSON out |
-| [examples/](examples/) | ticket triage, benchmark |
+| [examples/](examples/) | ticket triage, benchmark, slot-bias and vocabulary-mass probes |
 
 ## Credit
 
@@ -131,9 +314,12 @@ run float32 and a fixed batch size.
   state in, typed probabilistic decisions out.
 - [TheoLeeCJ/SemIf][semif], for showing the approach reproduces on 4B open models, with
   benchmarks and a calibration study.
+- [kikoncuo/jevfire][jevfire], a vLLM implementation of the same idea, for vocabulary
+  mass, abstention thresholds, and a `guarantees.md` worth copying the shape of.
 - [NandhaKishorM/laya][laya], which reaches the same place from the other direction —
   encoder classifiers rather than a decoder's logits.
 
 [jev]: https://typesafe.ai/blog/introducing-system-one-models-and-jev
 [semif]: https://github.com/TheoLeeCJ/SemIf
 [laya]: https://github.com/NandhaKishorM/laya
+[jevfire]: https://github.com/kikoncuo/jevfire
