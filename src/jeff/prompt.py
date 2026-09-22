@@ -113,6 +113,23 @@ class Answer:
         return sum(self.masses) / len(self.masses) if self.masses else float("nan")
 
     @property
+    def stability(self) -> float:
+        """Share of layouts that independently picked the answer you were given.
+
+        The one to gate on. `disagreement` measures how far the *distributions*
+        moved, which a wide menu will do freely without ever changing its mind;
+        this measures how often the *decision* survived being relabelled. 1.0
+        means every layout agreed, 0.4 means the answer is a coin flip wearing a
+        confidence interval. Always 1.0 with one permutation, which is exactly
+        as informative as one permutation deserves.
+        """
+        if len(self.samples) < 2:
+            return 1.0
+        winner = max(range(len(self.probabilities)), key=self.probabilities.__getitem__)
+        agreed = sum(max(range(len(s)), key=s.__getitem__) == winner for s in self.samples)
+        return agreed / len(self.samples)
+
+    @property
     def disagreement(self) -> float:
         """How much the answer moved when the options were relabelled.
 
@@ -176,6 +193,7 @@ class Answer:
         }
         if self.permutations > 1:
             out["permutations"] = self.permutations
+            out["stability"] = round(self.stability, 6)
             out["disagreement"] = round(self.disagreement, 6)
         return out
 

@@ -13,7 +13,7 @@ import pytest
 import torch
 
 from jeff.engine import pool
-from jeff.prompt import cyclic_layouts
+from jeff.prompt import Answer, Question, cyclic_layouts
 
 
 def test_one_permutation_is_the_question_as_written():
@@ -96,3 +96,31 @@ def test_mean_and_logmean_agree_when_there_is_no_bias():
 def test_rejects_unknown_aggregate():
     with pytest.raises(ValueError):
         pool(torch.zeros(2, 3), "median")
+
+
+def _answer(probabilities, samples):
+    question = Question("probe", tuple("abc"[: len(probabilities)]))
+    return Answer(question, tuple(probabilities), (), tuple(tuple(s) for s in samples))
+
+
+def test_stability_is_the_share_of_layouts_that_agree():
+    # Pooled winner is option 0; two of three layouts picked it themselves.
+    answer = _answer([0.5, 0.3, 0.2], [[0.9, 0.05, 0.05], [0.8, 0.1, 0.1], [0.1, 0.8, 0.1]])
+    assert answer.stability == pytest.approx(2 / 3)
+
+
+def test_stability_is_one_when_every_layout_agrees():
+    answer = _answer([0.6, 0.4], [[0.9, 0.1], [0.55, 0.45], [0.7, 0.3]])
+    assert answer.stability == 1.0
+
+
+def test_one_permutation_claims_nothing():
+    assert _answer([0.9, 0.1], []).stability == 1.0
+    assert _answer([0.9, 0.1], [[0.9, 0.1]]).stability == 1.0
+
+
+def test_stability_and_disagreement_are_different_questions():
+    """A wide menu can move a long way between layouts and still never change its mind."""
+    answer = _answer([0.4, 0.3, 0.3], [[0.9, 0.05, 0.05], [0.4, 0.35, 0.25]])
+    assert answer.stability == 1.0          # both layouts chose option 0
+    assert answer.disagreement > 0.4        # but the distributions are far apart
