@@ -113,6 +113,7 @@ class Jeff:
         min_probability: float = 0.0,
         min_mass: float = 0.0,
         max_batch: int = 16,
+        max_batch_tokens: int = 16384,
     ) -> None:
         self.device = _pick_device(device)
         if dtype is None:
@@ -131,6 +132,7 @@ class Jeff:
         self.min_probability = min_probability
         self.min_mass = min_mass
         self.max_batch = max_batch
+        self.max_batch_tokens = max_batch_tokens
         self.stats: dict[str, Any] = {}
         self._tokens: dict[str, list[int]] = {}
         self._pad = self.tokenizer.pad_token_id
@@ -230,6 +232,28 @@ class Jeff:
             )
         return out.logits[:, -1, :].float()
 
+    def _chunks(self, prompts: list[list[int]], prefix_len: int):
+        """Split the rows into batches that fit, by count and by KV footprint.
+
+        Every row in a batch carries its own copy of the prefix in the cache, so
+        the memory a batch needs goes as `width x (prefix + suffix)`. A short
+        state can take the full `max_batch`; a nine-thousand-token document
+        cannot, and would otherwise ask for more KV than the card has. The
+        budget keeps the same code working across both instead of making the
+        caller guess a batch size per document.
+        """
+        start = 0
+        while start < len(prompts):
+            width, widest = 0, 0
+            while start + width < len(prompts) and width < self.max_batch:
+                longest = max(widest, len(prompts[start + width]) - prefix_len)
+                if width and (width + 1) * (prefix_len + longest) > self.max_batch_tokens:
+                    break
+                widest, width = longest, width + 1
+            width = max(width, 1)
+            yield prompts[start : start + width]
+            start += width
+
     # -- public api -----------------------------------------------------------
 
     def ask(
@@ -323,8 +347,7 @@ class Jeff:
         # batch size of one, which is five times slower here. Batch width is
         # what buys throughput, and padding is second-order.
         scored = []
-        for start in range(0, len(prompts), self.max_batch):
-            chunk = prompts[start : start + self.max_batch]
+        for chunk in self._chunks(prompts, prefix_len):
             if prefix_len:
                 scored.append(self._score_batch(kv, prefix_len, [p[prefix_len:] for p in chunk]))
             else:

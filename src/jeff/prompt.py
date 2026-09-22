@@ -36,6 +36,8 @@ class Question:
     text: str
     options: tuple[str, ...] = ("yes", "no")
     id: str | None = None
+    descriptions: tuple[str, ...] | None = None
+    """One rubric line per option, shown beside it. The answer stays the option."""
 
     def __post_init__(self) -> None:
         if not self.text.strip():
@@ -44,6 +46,9 @@ class Question:
             raise ValueError(f"a question needs 2..{MAX_OPTIONS} options, got {len(self.options)}")
         if len(set(self.options)) != len(self.options):
             raise ValueError(f"duplicate options in {self.text!r}")
+        if self.descriptions is not None and len(self.descriptions) != len(self.options):
+            raise ValueError(f"{self.text!r} has {len(self.options)} options but "
+                             f"{len(self.descriptions)} descriptions")
 
     @property
     def key(self) -> str:
@@ -57,7 +62,13 @@ class Question:
             return cls(value)
         if isinstance(value, Mapping):
             options = value.get("options", ("yes", "no"))
-            return cls(text=value["text"], options=tuple(options), id=value.get("id"))
+            rubric = value.get("descriptions")
+            return cls(
+                text=value["text"],
+                options=tuple(options),
+                id=value.get("id"),
+                descriptions=tuple(rubric) if rubric else None,
+            )
         raise TypeError(f"cannot read a question from {type(value).__name__}")
 
 
@@ -66,9 +77,15 @@ def boolean(text: str, *, id: str | None = None) -> Question:
     return Question(text, ("yes", "no"), id)
 
 
-def choice(text: str, options: Sequence[str], *, id: str | None = None) -> Question:
-    """A categorical decision over named options."""
-    return Question(text, tuple(options), id)
+def choice(
+    text: str,
+    options: Sequence[str],
+    *,
+    id: str | None = None,
+    descriptions: Sequence[str] | None = None,
+) -> Question:
+    """A categorical decision over named options, each with an optional rubric line."""
+    return Question(text, tuple(options), id, tuple(descriptions) if descriptions else None)
 
 
 def score(text: str, low: int = 1, high: int = 5, *, id: str | None = None) -> Question:
@@ -220,7 +237,11 @@ def messages(
     average a slot bias out.
     """
     order = range(len(question.options)) if layout is None else layout
-    options = "\n".join(f"{slots[j]}. {question.options[i]}" for j, i in enumerate(order))
+    rubric = question.descriptions
+    options = "\n".join(
+        f"{slots[j]}. {question.options[i]}" + (f" — {rubric[i]}" if rubric else "")
+        for j, i in enumerate(order)
+    )
     user = f"<state>\n{state}\n</state>\n\nQuestion: {question.text}\nOptions:\n{options}"
     return [{"role": "system", "content": SYSTEM}, {"role": "user", "content": user}]
 

@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# eval payloads and derived data are downloaded, not committed
+evals/data/

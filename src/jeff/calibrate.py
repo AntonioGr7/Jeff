@@ -18,16 +18,25 @@ from typing import Sequence
 import torch
 
 
+BOUNDS = (0.05, 50.0)
+
+
 def fit_temperature(
     logits: Sequence[Sequence[float]],
     labels: Sequence[int],
     *,
     steps: int = 200,
+    bounds: tuple[float, float] = BOUNDS,
 ) -> float:
     """Return the temperature minimising negative log-likelihood on held-out data.
 
     `logits` are per-example option logits (`Answer.logits`), `labels` the index
     of the correct option. Rows may have different option counts.
+
+    The result is clamped to `bounds`. A fit that runs to the ceiling is not a
+    number, it is a verdict: the scores were anti-correlated with the truth, so
+    the likelihood is best served by flattening them to nothing. Compare the
+    result against `bounds` before quoting it.
     """
     if len(logits) != len(labels):
         raise ValueError("need one label per row")
@@ -55,7 +64,7 @@ def fit_temperature(
         return loss
 
     optimiser.step(closure)
-    return float(log_t.exp().item())
+    return float(min(max(log_t.exp().item(), bounds[0]), bounds[1]))
 
 
 def expected_calibration_error(

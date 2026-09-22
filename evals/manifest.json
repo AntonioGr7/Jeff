@@ -1,0 +1,36 @@
+{
+  "source": "https://evals.typesafe.ai/",
+  "retrieved_at": "2026-09-22",
+  "scope": "Public viewer examples only; 20 of 711 reported cases.",
+  "note": "Each source is the site's own viewer payload. Its ?v= parameter is the first eight hex digits of the file's sha256, so the checksums below are the site's own content addresses. If a download fails to verify, upstream has been republished: refresh the ?v= and the checksum together, and say so in any result you publish.",
+  "workflows": [
+    {
+      "workflow": "agent_trace_observability",
+      "source": "https://evals.typesafe.ai/agent_trace_observability-cases.js?v=4a3821a2",
+      "sha256": "4a3821a24366dc9830e12b481a23c96d0ab70e3c473b59551b88e8d0c4b615b3",
+      "reported_total_cases": 117,
+      "public_cases": 5
+    },
+    {
+      "workflow": "security_incidents",
+      "source": "https://evals.typesafe.ai/security_incidents-cases.js?v=6c96b19f",
+      "sha256": "6c96b19f192d07004613afc281a31712aa7d04bd75e31a3afe2322174ade0645",
+      "reported_total_cases": 240,
+      "public_cases": 5
+    },
+    {
+      "workflow": "invoice_processing",
+      "source": "https://evals.typesafe.ai/invoice_processing-cases.js?v=8c2f8869",
+      "sha256": "8c2f886978a30e637d577cd0713b3cf12bb622ef7210fcc9a4be47540a6df27f",
+      "reported_total_cases": 150,
+      "public_cases": 5
+    },
+    {
+      "workflow": "customer_service",
+      "source": "https://evals.typesafe.ai/customer_service-cases.js?v=066f789b",
+      "sha256": "066f789bcc17ae906a17fc37ad4fd2f2bb1e881245aeb76b524715bc962a2493",
+      "reported_total_cases": 204,
+      "public_cases": 5
+    }
+  ]
+}
