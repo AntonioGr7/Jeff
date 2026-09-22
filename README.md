@@ -249,13 +249,16 @@ Eight decisions over one support ticket, `Qwen/Qwen3-0.6B` in bf16 on an RTX 205
 
 | | time | |
 |---|---|---|
-| generate one answer per question | 3211 ms | |
-| typed readout, no prefix sharing | 2300 ms | 1.4× |
-| Jeff | 308 ms | 10.4× |
-| Jeff, state already prefilled | 181 ms | 17.8× |
+| generate one answer per question | 2807 ms | |
+| typed readout, no prefix sharing | 1304 ms | 2.2× |
+| Jeff | 258 ms | 10.9× |
+| Jeff, state already prefilled | 175 ms | 16.0× |
 
-174 shared tokens prefilled once instead of eight times; zero tokens generated. The gap widens with the size of the state and the number of questions,
-which is exactly the shape of real triage, extraction and routing workloads.
+Medians of three invocations, each best-of-three internally. A laptop GPU's clocks move
+these by ±15% between runs, so read the ratios, not the milliseconds. 174 shared tokens
+prefilled once instead of eight times; zero tokens generated. The gap widens with the
+size of the state and the number of questions, which is exactly the shape of real
+triage, extraction and routing workloads.
 
 ## A worked example
 

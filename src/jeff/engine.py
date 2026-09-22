@@ -316,6 +316,12 @@ class Jeff:
         kv = self._prefill(prefix) if prefix_len else []
         prefilled = time.perf_counter()
 
+        # Rows stay in question order on purpose. A question's layouts all have
+        # the same length, so the natural order is already length-clustered;
+        # sorting globally breaks that up and measures slower. Repacking to
+        # minimise padding is worse still — the optimum of that objective is a
+        # batch size of one, which is five times slower here. Batch width is
+        # what buys throughput, and padding is second-order.
         scored = []
         for start in range(0, len(prompts), self.max_batch):
             chunk = prompts[start : start + self.max_batch]
@@ -333,7 +339,8 @@ class Jeff:
         layouts: list[list[tuple[int, ...]]] = [[] for _ in questions]
         masses: list[list[float]] = [[] for _ in questions]
         for (index, layout), row in zip(rows, logits):
-            shown = torch.log_softmax(row, dim=-1)[self._slot_tokens(chosen[index])]
+            # Normalise against the whole vocabulary without materialising it.
+            shown = row[self._slot_tokens(chosen[index])] - torch.logsumexp(row, dim=-1)
             masses[index].append(float(shown.exp().sum()))
             layouts[index].append(layout)
             canonical = torch.empty_like(shown)
