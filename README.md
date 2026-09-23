@@ -335,6 +335,26 @@ untouched and only the confidences move. `jeff.calibrate` also has
 that it helped. This is the honest, cheap version of what TypeSafe trains for directly
 with RLCD; it will not manufacture knowledge the model does not have.
 
+## Is any of it *right*?
+
+Everything above argues from mechanism: the prefill is exact, the cover cancels, the mass
+catches a broken prompt. None of it says whether the answers are correct. [evals/](evals/)
+scores that against the only public data with typed questions and reference answers
+attached — TypeSafe's twenty published cases, 318 scoreable questions over 45 documents:
+
+```bash
+uv run evals/dataset.py     # download and verify; nothing is vendored
+uv run evals/run.py         # as-written vs debiased, with cross-fitted calibration
+```
+
+It reports accuracy, Brier, ECE and NLL by question type and workflow, how many answers
+relabelling **fixed** versus **broke**, and how Jev's own saved answers do on the same
+rows. Calibration is cross-fitted, so no question is scored by a temperature that saw it.
+
+Those are twenty diagnostic cases picked to show disagreement, with model-derived
+references. [evals/README.md](evals/README.md) has the full caveats; a score there is not
+a reproduction of the published benchmark and should not be presented as one.
+
 ## Accuracy of the shared prefill
 
 `tests/test_engine.py` asserts the contract that makes any of this trustworthy: answers
@@ -354,6 +374,7 @@ run float32 and a fixed batch size.
 | [src/jeff/calibrate.py](src/jeff/calibrate.py) | temperature fitting and calibration metrics |
 | [src/jeff/cli.py](src/jeff/cli.py) | `jeff` — JSON in, JSON out |
 | [examples/](examples/) | incident triage, benchmark, slot-bias and vocabulary-mass probes |
+| [evals/](evals/) | accuracy and calibration against TypeSafe's public examples |
 
 ## Credit
 
@@ -363,6 +384,9 @@ run float32 and a fixed batch size.
   benchmarks and a calibration study.
 - [kikoncuo/jevfire][jevfire], a vLLM implementation of the same idea, for vocabulary
   mass, abstention thresholds, and a `guarantees.md` worth copying the shape of.
+- [JoshuaSP/open-jev][open-jev], which reaches the same decisions through a diffusion
+  model's canvas, and which worked out how to turn TypeSafe's public viewer payloads into
+  an evaluable set of questions — the approach [evals/](evals/) follows.
 - [NandhaKishorM/laya][laya], which reaches the same place from the other direction —
   encoder classifiers rather than a decoder's logits.
 
@@ -370,3 +394,4 @@ run float32 and a fixed batch size.
 [semif]: https://github.com/TheoLeeCJ/SemIf
 [laya]: https://github.com/NandhaKishorM/laya
 [jevfire]: https://github.com/kikoncuo/jevfire
+[open-jev]: https://github.com/JoshuaSP/open-jev
