@@ -46,12 +46,18 @@ def _load_model(model: str, device: torch.device, dtype: torch.dtype, quantize: 
     into 4 GB. It is *not* a lossless speed-up. The logits move, so the answers
     can too, and a quantised model deserves its own eval run before its
     probabilities are trusted.
+
+    A checkpoint saved already quantised (`unsloth/Qwen3-4B-bnb-4bit`, say)
+    needs no `quantize` at all: its config says so, it downloads at a quarter
+    of the size, and it skips unpacking full-precision shards through host
+    memory on every load. `device_map` rather than `.to()` places it, because
+    a 4-bit model cannot be moved after the fact.
     """
     if quantize not in QUANTIZE:
         raise ValueError(f"quantize must be one of {QUANTIZE}")
-    kwargs: dict[str, Any] = dict(dtype=dtype, attn_implementation="sdpa")
+    kwargs: dict[str, Any] = dict(dtype=dtype, attn_implementation="sdpa", device_map={"": device})
     if quantize is None:
-        return AutoModelForCausalLM.from_pretrained(model, **kwargs).to(device).eval()
+        return AutoModelForCausalLM.from_pretrained(model, **kwargs).eval()
     if device.type != "cuda":
         raise ValueError("quantize='4bit' needs a CUDA device")
     try:
@@ -65,9 +71,7 @@ def _load_model(model: str, device: torch.device, dtype: torch.dtype, quantize: 
         bnb_4bit_use_double_quant=True,
         bnb_4bit_compute_dtype=dtype,
     )
-    return AutoModelForCausalLM.from_pretrained(
-        model, quantization_config=config, device_map={"": device}, **kwargs
-    ).eval()
+    return AutoModelForCausalLM.from_pretrained(model, quantization_config=config, **kwargs).eval()
 
 
 def _pick_device(device: str | None) -> torch.device:
