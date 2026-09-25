@@ -2,6 +2,23 @@
 
 Typed probabilistic decisions from a language model, without generating a single token.
 
+![Jeff playing Snake with Qwen3-4B in 4 bits: the board beside the model's preference for each move](assets/snake.png)
+
+That is Jeff playing Snake on a 4 GB laptop GPU. Each move asks twelve yes/no questions:
+for each direction, does the snake survive, does it get closer to the food, is it a dead
+end. All twelve are scored off **one prefill** of the board, and a few lines of Python
+turn the answers into a move. Nothing is generated and nothing is parsed. Qwen3-4B in 4
+bits ate 10 food in 60 moves and never once wanted a fatal move, at 2.4 s a move.
+
+```bash
+uv run examples/snake.py --model unsloth/Qwen3-4B-bnb-4bit --watch
+```
+
+The board comes with a line of fact per direction, so this is mostly reading. `--blind`
+drops the notes and asks the spatial question for real, and `--player greedy` is the
+baseline with no model at all. The 0.6B and 1.7B do not play: they only survive because
+a shield, plain code that overrides fatal moves, catches them.
+
 You have a blob of unstructured state — a support ticket, a diff, a transcript — and a
 dozen questions about it. The usual answer is a dozen prompts, a dozen generations and a
 dozen JSON parsers. Jeff prefills the state **once** and reads all dozen answers straight
@@ -297,27 +314,6 @@ happened to catch that report through instability in *other* fields, which is lu
 defence. At this size the hardening does not hold — do not put untrusted text in front of
 a small model and expect the system prompt to save you.
 
-## Snake
-
-[examples/snake.py](examples/snake.py) plays Snake with no generation at all. Each move
-asks twelve yes/no questions: for each direction, does the snake survive, does it get
-closer to the food, is it a dead end. All twelve are scored off one prefill of the board,
-under a full cyclic cover, and a few lines of Python turn the answers into a move.
-
-![Qwen3-4B in 4 bits playing Snake: the board beside the model's preference for each move](assets/snake.png)
-
-```bash
-uv run examples/snake.py --model unsloth/Qwen3-4B-bnb-4bit --watch
-```
-
-The 0.6B and 1.7B cannot play: they survive only because a shield, ordinary code that
-overrides fatal moves, catches them. The 4B, in 4 bits on a 4 GB laptop GPU, ate 10 food
-in 60 moves. Its own pick was never fatal, so the shield never fired, and it agreed with
-the scripted planner on every move, at 2.4 s per move. The state carries a line of fact
-per direction, so this is mostly reading. `--blind` drops those notes and asks the
-spatial question for real, and `--player greedy` is the no-model baseline to compare
-against.
-
 ## Install
 
 ```bash
@@ -434,7 +430,7 @@ run float32 and a fixed batch size.
 | [src/jeff/slots.py](src/jeff/slots.py) | answer symbols, per-question draws, bias estimator |
 | [src/jeff/calibrate.py](src/jeff/calibrate.py) | temperature fitting and calibration metrics |
 | [src/jeff/cli.py](src/jeff/cli.py) | `jeff` — JSON in, JSON out |
-| [examples/](examples/) | incident triage, benchmark, slot-bias and vocabulary-mass probes |
+| [examples/](examples/) | Snake, incident triage, benchmark, slot-bias and vocabulary-mass probes |
 | [evals/](evals/) | accuracy and calibration against TypeSafe's public examples |
 
 ## Credit
