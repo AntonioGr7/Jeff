@@ -8,6 +8,10 @@ confidences move.
 
     t = fit_temperature([a.logits for a in answers], labels)
     answers = jeff.ask(state, questions, temperature=t)   # or Jeff(temperature=t)
+
+Calibration says whether a 0.9 means 0.9. `risk_coverage` asks the question you
+deploy on: if you only act above some confidence, how much do you get to act
+on, and how often is it wrong?
 """
 
 from __future__ import annotations
@@ -108,3 +112,64 @@ def negative_log_likelihood(
     return -sum(
         math.log(max(row[label], 1e-12)) for row, label in zip(probabilities, labels)
     ) / len(labels)
+
+
+def risk_coverage(
+    probabilities: Sequence[Sequence[float]], labels: Sequence[int]
+) -> list[tuple[float, float, float]]:
+    """The selective-prediction curve: `(threshold, coverage, risk)` at every cut.
+
+    Answer only when the top probability is at least `threshold` and abstain
+    otherwise; `coverage` is the share answered and `risk` the error rate on
+    that share. `threshold` is exactly what `min_probability` expects.
+
+    Tied confidences stay together. No threshold can answer one of two rows at
+    0.9998 and withhold the other, and a saturated model produces a lot of
+    those, so cutting between them would report a coverage you cannot deploy.
+    """
+    if len(probabilities) != len(labels):
+        raise ValueError("need one label per row")
+    if not labels:
+        raise ValueError("need at least one labelled row")
+    scored = []
+    for row, label in zip(probabilities, labels):
+        best = max(range(len(row)), key=row.__getitem__)
+        scored.append((row[best], best == label))
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+
+    curve, wrong = [], 0
+    for index, (confidence, hit) in enumerate(scored):
+        wrong += not hit
+        if index + 1 == len(scored) or scored[index + 1][0] < confidence:
+            kept = index + 1
+            curve.append((confidence, kept / len(scored), wrong / kept))
+    return curve
+
+
+def coverage_at_risk(
+    probabilities: Sequence[Sequence[float]], labels: Sequence[int], risk: float = 0.05
+) -> float:
+    """Largest share of answers a single threshold can keep at or below `risk`.
+
+    The number that says how much traffic you could automate. Accuracy can move
+    a few points while this moves tenfold, because it depends on whether the
+    confident answers are the right ones, not on how many are right overall.
+    Zero when even the most confident group is wrong too often.
+    """
+    return max((c for _, c, r in risk_coverage(probabilities, labels) if r <= risk), default=0.0)
+
+
+def area_under_risk_coverage(
+    probabilities: Sequence[Sequence[float]], labels: Sequence[int]
+) -> float:
+    """AURC: the risk averaged over every coverage; lower is better.
+
+    `coverage_at_risk` reads one point of the curve, this summarises all of it,
+    so it does not hinge on where you put the target. Its floor is not zero: a
+    perfect ranking still pays for the errors it has to answer at full coverage.
+    """
+    area, previous = 0.0, 0.0
+    for _, coverage, risk in risk_coverage(probabilities, labels):
+        area += risk * (coverage - previous)
+        previous = coverage
+    return area

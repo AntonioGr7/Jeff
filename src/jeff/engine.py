@@ -35,6 +35,39 @@ from .slots import DEFAULT_SLOTS, resolve_slots, take_slots
 
 DEFAULT_MODEL = "Qwen/Qwen3-0.6B"
 AGGREGATES = ("logmean", "mean")
+QUANTIZE = (None, "4bit")
+
+
+def _load_model(model: str, device: torch.device, dtype: torch.dtype, quantize: str | None):
+    """The model, either as stored or with its linear layers held in 4 bits.
+
+    `4bit` is bitsandbytes NF4 with double quantisation: weights stay packed on
+    the card and are unpacked per matmul into `dtype`, which is what fits a 4B
+    into 4 GB. It is *not* a lossless speed-up. The logits move, so the answers
+    can too, and a quantised model deserves its own eval run before its
+    probabilities are trusted.
+    """
+    if quantize not in QUANTIZE:
+        raise ValueError(f"quantize must be one of {QUANTIZE}")
+    kwargs: dict[str, Any] = dict(dtype=dtype, attn_implementation="sdpa")
+    if quantize is None:
+        return AutoModelForCausalLM.from_pretrained(model, **kwargs).to(device).eval()
+    if device.type != "cuda":
+        raise ValueError("quantize='4bit' needs a CUDA device")
+    try:
+        from transformers import BitsAndBytesConfig
+        import bitsandbytes  # noqa: F401
+    except ImportError as error:
+        raise ImportError("quantize='4bit' needs bitsandbytes: uv sync --extra quant") from error
+    config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_compute_dtype=dtype,
+    )
+    return AutoModelForCausalLM.from_pretrained(
+        model, quantization_config=config, device_map={"": device}, **kwargs
+    ).eval()
 
 
 def _pick_device(device: str | None) -> torch.device:
@@ -104,6 +137,7 @@ class Jeff:
         *,
         device: str | None = None,
         dtype: torch.dtype | None = None,
+        quantize: str | None = None,
         temperature: float = 1.0,
         permutations: int | str = 1,
         aggregate: str = "logmean",
@@ -119,10 +153,9 @@ class Jeff:
         if dtype is None:
             dtype = torch.float32 if self.device.type == "cpu" else torch.bfloat16
         self.tokenizer = AutoTokenizer.from_pretrained(model)
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model, dtype=dtype, attn_implementation="sdpa"
-        ).to(self.device).eval()
+        self.model = _load_model(model, self.device, dtype, quantize)
         self.name = model
+        self.quantize = quantize
         self.temperature = temperature
         self.permutations = permutations
         self.aggregate = aggregate

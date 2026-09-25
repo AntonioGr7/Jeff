@@ -13,6 +13,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+quant = [
+    "bitsandbytes>=0.45",
+]
 
 [project.scripts]
 jeff = "jeff.cli:main"

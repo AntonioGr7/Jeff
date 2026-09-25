@@ -28,6 +28,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("input", nargs="?", help="JSON file with 'state' and 'questions' (default: stdin)")
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--device", default=None, help="cuda, mps, cpu (default: best available)")
+    parser.add_argument("--4bit", dest="quantize", action="store_const", const="4bit",
+                        help="hold the weights in 4 bits (NF4), for models too big for the card")
     parser.add_argument("--temperature", type=float, default=1.0, help="calibration temperature")
     parser.add_argument(
         "--permutations",
@@ -69,6 +71,7 @@ def main(argv: list[str] | None = None) -> int:
     jeff = Jeff(
         args.model,
         device=args.device,
+        quantize=args.quantize,
         temperature=args.temperature,
         permutations="all" if args.permutations == "all" else int(args.permutations),
         aggregate=args.aggregate,

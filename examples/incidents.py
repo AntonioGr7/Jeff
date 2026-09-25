@@ -146,6 +146,8 @@ def show(name: str, answers: dict, args) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--model", default=None, help="a bigger model if you have the VRAM")
+    parser.add_argument("--4bit", dest="quantize", action="store_const", const="4bit",
+                        help="load the model in 4 bits (NF4)")
     parser.add_argument("--permutations", default="all", help="N, or 'all' (default)")
     parser.add_argument("--min-mass", type=float, default=0.5)
     parser.add_argument("--min-probability", type=float, default=0.45)
@@ -156,6 +158,7 @@ def main() -> None:
 
     jeff = Jeff(
         *( [args.model] if args.model else [] ),
+        quantize=args.quantize,
         min_mass=args.min_mass,
         min_probability=args.min_probability,
     )

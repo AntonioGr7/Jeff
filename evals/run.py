@@ -30,7 +30,9 @@ from dataset import load
 from jeff import Jeff, Question
 from jeff.calibrate import (
     BOUNDS,
+    area_under_risk_coverage,
     brier_score,
+    coverage_at_risk,
     expected_calibration_error,
     fit_temperature,
     negative_log_likelihood,
@@ -86,7 +88,14 @@ def ask_all(jeff: Jeff, rows: list[dict], **settings) -> list[dict]:
 
 
 def metrics(results: list[dict], temperature: float | None = None) -> dict:
-    """Accuracy plus the three proper-scoring numbers, optionally recalibrated."""
+    """Accuracy, the three proper-scoring numbers and the selective ones, optionally recalibrated.
+
+    `cov@5%` is the share of answers you could act on at a 5% error rate —
+    what threshold-gating buys — and `aurc` summarises the whole trade-off.
+    Both depend on which answers are confident, not on how confident they are,
+    so a temperature leaves them alone on yes/no questions and moves them only
+    where option counts differ between rows.
+    """
     if temperature:
         rows = [_rescale(result, temperature) for result in results]
     else:
@@ -103,6 +112,8 @@ def metrics(results: list[dict], temperature: float | None = None) -> dict:
         "brier": brier_score(probabilities, labels),
         "ece": expected_calibration_error(probabilities, labels),
         "nll": negative_log_likelihood(probabilities, labels),
+        "cov@5%": coverage_at_risk(probabilities, labels, 0.05),
+        "aurc": area_under_risk_coverage(probabilities, labels),
     }
 
 
@@ -159,22 +170,29 @@ def against_jev(results: list[dict]) -> dict | None:
         jev = max(result["jev_probabilities"], key=result["jev_probabilities"].get)
         jev_correct += jev == result["reference"]
         agree += jev == result["predicted"]
+    labels = [r["label"] for r in usable]
+    jev_rows = [[r["jev_probabilities"].get(o, 0.0) for o in r["options"]] for r in usable]
+    ours_rows = [[r["probabilities"][o] for o in r["options"]] for r in usable]
     return {
         "n": len(usable),
         "jev_accuracy": jev_correct / len(usable),
         "ours_accuracy": sum(r["correct"] for r in usable) / len(usable),
         "agreement": agree / len(usable),
+        "jev_coverage": coverage_at_risk(jev_rows, labels, 0.05),
+        "ours_coverage": coverage_at_risk(ours_rows, labels, 0.05),
     }
 
 
 def line(label: str, m: dict) -> str:
     return (f"  {label:<24} {m['accuracy']:7.1%} {m['brier']:8.3f} "
-            f"{m['ece']:7.3f} {m['nll']:7.3f}")
+            f"{m['ece']:7.3f} {m['nll']:7.3f} {m['cov@5%']:7.1%} {m['aurc']:7.3f}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--model", default=None)
+    parser.add_argument("--4bit", dest="quantize", action="store_const", const="4bit",
+                        help="load the model in 4 bits (NF4)")
     parser.add_argument("--config", choices=[*CONFIGS, "both"], default="both")
     parser.add_argument("--workflow", action="append", help="limit to these workflows")
     parser.add_argument("--limit", type=int, help="first N questions, for a smoke run")
@@ -194,12 +212,14 @@ def main() -> None:
 
     jeff = Jeff(
         *([args.model] if args.model else []),
+        quantize=args.quantize,
         max_batch=args.max_batch,
         max_batch_tokens=args.max_batch_tokens,
     )
     documents = len({row["document_id"] for row in rows})
-    print(f"{len(rows)} questions over {documents} documents, model {jeff.name}\n")
-    print(f"  {'configuration':<24} {'accuracy':>7} {'brier':>8} {'ECE':>7} {'NLL':>7}")
+    print(f"{len(rows)} questions over {documents} documents, model {jeff.name}"
+          + (f" in {jeff.quantize}" if jeff.quantize else "") + "\n")
+    print(f"  {'configuration':<24} {'accuracy':>7} {'brier':>8} {'ECE':>7} {'NLL':>7} {'cov@5%':>7} {'AURC':>7}")
 
     names = list(CONFIGS) if args.config == "both" else [args.config]
     everything = {}
@@ -237,6 +257,8 @@ def main() -> None:
         print(f"\nOn the {comparison['n']} rows where Jev's saved answer is available: "
               f"Jev {comparison['jev_accuracy']:.1%}, this {comparison['ours_accuracy']:.1%}, "
               f"agreeing with each other {comparison['agreement']:.1%} of the time.")
+        print(f"Answerable at a 5% error rate: Jev {comparison['jev_coverage']:.1%}, "
+              f"this {comparison['ours_coverage']:.1%}.")
 
     print("\nTwenty diagnostic cases with model-derived references; see evals/README.md.")
     if args.json:

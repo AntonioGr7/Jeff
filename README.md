@@ -308,6 +308,19 @@ Default model is `Qwen/Qwen3-0.6B` — small enough for a 4 GB card. Any causal 
 tokeniser gives each of `A`–`P` a single token will work; pass it as `Jeff("...")` or
 `--model`. Bigger is better if it fits.
 
+If it does not fit, hold the weights in 4 bits:
+
+```bash
+uv sync --extra quant                                  # bitsandbytes, CUDA only
+uv run evals/run.py --model Qwen/Qwen3-4B --4bit       # Jeff(..., quantize="4bit")
+```
+
+This is bitsandbytes NF4. The weights stay packed on the card, which is what fits a 4B
+into 4 GB. A GGUF file loaded through transformers does not do this: transformers
+unpacks it to full precision as it loads. Quantising moves the logits, so give a 4-bit
+model its own eval run before trusting its probabilities. A bigger model in 4 bits
+usually beats a smaller one at full precision, but measure it.
+
 From the shell:
 
 ```bash
@@ -334,6 +347,29 @@ untouched and only the confidences move. `jeff.calibrate` also has
 `expected_calibration_error`, `brier_score` and `negative_log_likelihood` for checking
 that it helped. This is the honest, cheap version of what TypeSafe trains for directly
 with RLCD; it will not manufacture knowledge the model does not have.
+
+Calibration says whether a 0.9 means 0.9. What you actually deploy is a threshold, and
+the question there is different: if you only act above some confidence, how much do you
+get to act on, and how often is it wrong?
+
+```python
+from jeff.calibrate import coverage_at_risk, risk_coverage
+
+coverage_at_risk(dev_probabilities, dev_labels, 0.05)   # share you can automate at 5% error
+threshold = min(t for t, _, risk in risk_coverage(dev_probabilities, dev_labels) if risk <= 0.05)
+jeff = Jeff(min_probability=threshold)
+```
+
+This is the number to watch. It depends on whether the *confident* answers are the right
+ones, so accuracy can move a few points while it moves tenfold. On a partial 0.6B run
+over the eval set (67 rows with Jev's saved answers alongside), Jev's answers stay under
+5% error on 61% of the rows and ours on 1.5%. That gap is much wider than the accuracy
+gap. `area_under_risk_coverage` summarises the whole curve instead of one point of it.
+
+The `min(...)` picks the widest cut whose own error rate is under target, which is the
+point `coverage_at_risk` reports. It raises if no cut qualifies, and that is the right
+answer: nothing here is safe to automate. A threshold from a dev set is an estimate,
+not a guarantee, so leave some margin when the dev set is small.
 
 ## Is any of it *right*?
 

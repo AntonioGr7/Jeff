@@ -270,6 +270,8 @@ def frame(game: Game, header: str, prefs: dict[str, float] | None, move: str,
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--model", default=None, help="a bigger model if you have the VRAM")
+    parser.add_argument("--4bit", dest="quantize", action="store_const", const="4bit",
+                        help="load the model in 4 bits (NF4)")
     parser.add_argument("--player", choices=["jeff", "greedy", "random"], default="jeff")
     parser.add_argument("--ask", choices=["each", "menu"], default="each",
                         help="yes/no questions per direction (default), or one four-way choice")
@@ -291,7 +293,8 @@ def main() -> None:
 
     jeff = None
     if args.player == "jeff":
-        jeff = Jeff(*([args.model] if args.model else []), max_batch=args.max_batch)
+        jeff = Jeff(*([args.model] if args.model else []), quantize=args.quantize,
+                    max_batch=args.max_batch)
     permutations = "all" if args.permutations == "all" else int(args.permutations)
 
     delay = args.delay if args.delay or not args.watch else 0.15

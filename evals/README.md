@@ -65,6 +65,16 @@ that runs to the ceiling is reported as such, and means the scores were anti-cor
 with the truth — the likelihood is best served by flattening them away. That is a
 verdict on the model, not a number to quote.
 
+Two more columns ask the question you deploy on. **`cov@5%`** is the largest share of
+answers one confidence threshold can keep while at most 5% of the kept answers are wrong:
+how much of this traffic you could act on unattended. **`AURC`** is the error rate
+averaged over every coverage, so it does not hinge on where the target sits. Both depend
+on *which* answers are confident, not *how* confident they are. Accuracy can barely move
+while these move a lot. Tied confidences are never split, because no threshold can
+separate them. The same coverage is computed for Jev's saved answers on the same rows.
+With a few hundred rows, a 5% target leaves little room: one extra error among the most
+confident answers moves `cov@5%` by a lot, so read it as a rough figure.
+
 Rows are also reported by question type and workflow, with the stability and vocabulary
 mass distributions, because an aggregate accuracy on 318 heterogeneous questions hides
 more than it shows.
