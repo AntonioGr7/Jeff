@@ -311,11 +311,15 @@ tokeniser gives each of `A`–`P` a single token will work; pass it as `Jeff("..
 If it does not fit, hold the weights in 4 bits:
 
 ```bash
-uv sync --extra quant                                  # bitsandbytes, CUDA only
-uv run evals/run.py --model Qwen/Qwen3-4B --4bit       # Jeff(..., quantize="4bit")
+uv sync --extra quant                                        # bitsandbytes, CUDA only
+uv run evals/run.py --model unsloth/Qwen3-4B-bnb-4bit        # saved already quantised
+uv run evals/run.py --model Qwen/Qwen3-4B --4bit             # quantised on every load
 ```
 
-This is bitsandbytes NF4. The weights stay packed on the card, which is what fits a 4B
+Prefer a checkpoint saved in 4 bits. It is a 2.7 GB download instead of 8, and loading
+it does not stream full-precision shards through host memory. On WSL that host memory
+and the growing virtual disk are what give out first. Qwen3-4B that way needs 2.5 GB on
+the card, 2.75 GB at peak for a short state. Both routes are bitsandbytes NF4. The weights stay packed on the card, which is what fits a 4B
 into 4 GB. A GGUF file loaded through transformers does not do this: transformers
 unpacks it to full precision as it loads. Quantising moves the logits, so give a 4-bit
 model its own eval run before trusting its probabilities. A bigger model in 4 bits

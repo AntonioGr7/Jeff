@@ -57,6 +57,24 @@ def exact() -> Jeff:
     return Jeff(device="cpu", dtype=torch.float32)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="offloading is a CUDA path")
+def test_parking_the_prefix_in_host_memory_changes_nothing(jeff: Jeff):
+    """The same tensors make a round trip, so the numbers match to the bit."""
+    try:
+        jeff.offload, jeff._prefix = False, None
+        resident = jeff.ask(STATE, QUESTIONS, permutations="all")
+        assert not jeff.stats["prefix_offloaded"]
+        jeff.offload, jeff._prefix = True, None
+        parked = jeff.ask(STATE, QUESTIONS, permutations="all")
+        assert jeff.stats["prefix_offloaded"]
+        assert jeff._prefix[1][0][0].device.type == "cpu"
+    finally:
+        jeff.offload, jeff._prefix = "auto", None
+    for a, b in zip(resident, parked):
+        assert a.probabilities == b.probabilities
+        assert a.masses == b.masses
+
+
 def test_shared_prefill_matches_one_at_a_time(exact: Jeff):
     """Batched off a shared cache, vs. each prompt scored alone. Same numbers."""
     together = exact.ask(STATE, QUESTIONS)

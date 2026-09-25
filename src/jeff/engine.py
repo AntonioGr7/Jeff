@@ -22,6 +22,7 @@ from typing import Any, Iterable, Sequence
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
+from transformers.cache_utils import Cache, CacheLayerMixin, DynamicLayer
 
 from .prompt import (
     Answer,
@@ -96,6 +97,70 @@ def _cache_depth(cache: DynamicCache) -> int:
     return len(cache.layers) if hasattr(cache, "layers") else len(cache.key_cache)
 
 
+def _to_host(tensor: torch.Tensor) -> torch.Tensor:
+    """A plain host copy, deliberately *not* pinned.
+
+    Pinning would make the trip back faster, but torch's pinned allocator
+    rounds every block up to a power of two: a 9k-token prefix on a 4B is 72
+    blocks of 38 MB, which it turns into 4.6 GB of locked RAM, and on WSL that
+    was enough to take the whole VM down. Pageable memory costs what it holds.
+    """
+    return tensor.to("cpu")
+
+
+class _ParkingLayer(DynamicLayer):
+    """A prefill layer that moves its keys and values to host memory as they are made.
+
+    Prefill is one forward with no past, so each layer's attention needs only
+    what it has just computed. Returning that and keeping a host copy means the
+    card never holds more than one layer of a long prefix at a time.
+    """
+
+    def update(self, key_states, value_states, cache_kwargs=None):
+        if not self.is_initialized:
+            self.lazy_initialization(key_states)
+        self.keys, self.values = _to_host(key_states), _to_host(value_states)
+        return key_states, value_states
+
+
+class _PrefixLayer(CacheLayerMixin):
+    """One layer of a shared prefix that a suffix batch reads but never extends.
+
+    `DynamicLayer.update` concatenates and *keeps* the result, so a batch used
+    to hold the stored prefix plus a `width x (prefix + suffix)` copy of it for
+    every layer at once — twice the prefix at the very least. We only want the
+    logits at the end, never the extended cache, so this returns the
+    concatenation to attention and drops it: the copy lives for one layer, not
+    for the whole forward. When the prefix was parked in host memory it is
+    brought over here, one layer at a time.
+    """
+
+    is_sliding = False
+
+    def __init__(self, keys: torch.Tensor, values: torch.Tensor, width: int) -> None:
+        super().__init__()
+        self.keys, self.values, self.width = keys, values, width
+        self.is_initialized = True
+
+    def lazy_initialization(self, key_states: torch.Tensor) -> None:
+        pass
+
+    def update(self, key_states, value_states, cache_kwargs=None):
+        device = key_states.device
+        keys = self.keys.to(device, non_blocking=True).expand(self.width, -1, -1, -1)
+        values = self.values.to(device, non_blocking=True).expand(self.width, -1, -1, -1)
+        return torch.cat([keys, key_states], dim=-2), torch.cat([values, value_states], dim=-2)
+
+    def get_seq_length(self) -> int:
+        return self.keys.shape[-2]
+
+    def get_mask_sizes(self, cache_position: torch.Tensor) -> tuple[int, int]:
+        return self.get_seq_length() + cache_position.shape[0], 0
+
+    def get_max_cache_shape(self) -> int:
+        return -1
+
+
 def pool(samples: torch.Tensor, aggregate: str = "logmean") -> torch.Tensor:
     """Fold one question's per-layout log-probabilities into a single score.
 
@@ -142,6 +207,7 @@ class Jeff:
         device: str | None = None,
         dtype: torch.dtype | None = None,
         quantize: str | None = None,
+        offload: bool | str = "auto",
         temperature: float = 1.0,
         permutations: int | str = 1,
         aggregate: str = "logmean",
@@ -157,9 +223,13 @@ class Jeff:
         if dtype is None:
             dtype = torch.float32 if self.device.type == "cpu" else torch.bfloat16
         self.tokenizer = AutoTokenizer.from_pretrained(model)
+        if offload not in (True, False, "auto"):
+            raise ValueError("offload must be True, False or 'auto'")
         self.model = _load_model(model, self.device, dtype, quantize)
         self.name = model
         self.quantize = quantize
+        self.offload = offload
+        self._kv_bytes_per_token = self._kv_footprint(dtype)
         self.temperature = temperature
         self.permutations = permutations
         self.aggregate = aggregate
@@ -176,6 +246,7 @@ class Jeff:
         if self._pad is None:
             self._pad = self.tokenizer.eos_token_id
         self._prefix: tuple[tuple[int, ...], list[tuple[torch.Tensor, torch.Tensor]]] | None = None
+        self._offloaded = False
 
     # -- setup ----------------------------------------------------------------
 
@@ -209,37 +280,67 @@ class Jeff:
             text = self.tokenizer.apply_chat_template(turns, **kwargs)
         return self.tokenizer.encode(text, add_special_tokens=False)
 
+    def _kv_footprint(self, dtype: torch.dtype) -> int:
+        """Bytes of keys plus values one token costs across every layer."""
+        config = self.model.config
+        heads = getattr(config, "num_key_value_heads", None) or config.num_attention_heads
+        head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+        return 2 * config.num_hidden_layers * heads * head_dim * torch.empty((), dtype=dtype).element_size()
+
+    def _should_offload(self, prefix_len: int) -> bool:
+        """Park the prefix in host memory when keeping it on the card would crowd out the batch.
+
+        Half of what is free is the line: the suffix batch still needs room for
+        a layer's worth of prefix copy, its activations and the logits.
+        """
+        if self.offload != "auto":
+            return bool(self.offload) and self.device.type == "cuda"
+        if self.device.type != "cuda":
+            return False
+        free, _ = torch.cuda.mem_get_info(self.device)
+        return prefix_len * self._kv_bytes_per_token > free / 2
+
     # -- the trick ------------------------------------------------------------
 
     def _prefill(self, prefix: list[int]) -> list[tuple[torch.Tensor, torch.Tensor]]:
-        """Run the shared prefix once and keep its keys/values, reused across calls."""
+        """Run the shared prefix once and keep its keys/values, reused across calls.
+
+        A prefix too big to sit on the card beside the batch is parked in host
+        memory as it is computed and brought back one layer at a time when the
+        suffixes read it. That trades PCIe traffic for fitting at all: a
+        9k-token document on a 4B is 1.4 GB of cache, which a 4 GB card holding
+        the weights does not have.
+        """
         key = tuple(prefix)
         if self._prefix is not None and self._prefix[0] == key:
             return self._prefix[1]
+        self._prefix = None  # let the old prefix go before the new one arrives
+        offload = self._should_offload(len(prefix))
         ids = torch.tensor([prefix], device=self.device)
         with torch.inference_mode():
             out = self.model(
                 input_ids=ids,
                 attention_mask=torch.ones_like(ids),
+                past_key_values=Cache(layer_class_to_replicate=_ParkingLayer) if offload else None,
                 use_cache=True,
                 logits_to_keep=1,
             )
         cache = out.past_key_values
         kv = [tuple(t.detach() for t in _layer_kv(cache, i)) for i in range(_cache_depth(cache))]
         self._prefix = (key, kv)
+        self._offloaded = offload
         return kv
 
-    def _branch(self, kv: list[tuple[torch.Tensor, torch.Tensor]], width: int) -> DynamicCache:
-        """A fresh cache whose rows all view the same prefill.
+    def _branch(self, kv: list[tuple[torch.Tensor, torch.Tensor]], width: int) -> Cache:
+        """A fresh cache whose rows all read the same prefill, without copying it per row.
 
-        `expand` costs nothing: the suffix forward concatenates onto these
-        tensors rather than writing into them, so one prefill really does serve
-        the whole batch.
+        `expand` costs nothing, and `_PrefixLayer` hands each layer its
+        concatenation without keeping it, so one prefill really does serve the
+        whole batch and the extended cache never exists in full.
         """
-        cache = DynamicCache()
-        for index, (keys, values) in enumerate(kv):
-            cache.update(keys.expand(width, -1, -1, -1), values.expand(width, -1, -1, -1), index)
-        return cache
+        if not kv:
+            return DynamicCache()
+        return Cache(layers=[_PrefixLayer(keys, values, width) for keys, values in kv])
 
     def _score_batch(self, kv, prefix_len: int, suffixes: list[list[int]]) -> torch.Tensor:
         """Next-token logits at the end of every suffix, in one forward pass.
@@ -431,6 +532,7 @@ class Jeff:
             "prefix_tokens": prefix_len,
             "suffix_tokens": sum(len(p) - prefix_len for p in prompts),
             "saved_tokens": prefix_len * (len(prompts) - 1),
+            "prefix_offloaded": bool(prefix_len) and self._offloaded,
             "prefill_seconds": prefilled - started,
             "total_seconds": time.perf_counter() - started,
             "output_tokens": 0,
